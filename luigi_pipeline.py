@@ -2,7 +2,7 @@ import json
 import os.path
 import logging
 import sys
-import sqlite3
+import threading
 import datetime as dt
 import requests as rq
 import numpy as np
@@ -15,33 +15,46 @@ stdout_handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(stdout_handler)
 logger.setLevel(logging.DEBUG)
 
-data_dir = '/home/ec2-user/scraped/'
 SQLITE_DB = 'evetrader.db'
+ENGINE = sqlalchemy.create_engine('sqlite:///' + os.path.join('.', SQLITE_DB))
 
+ACTIVE_TYPE_IDS = pd.read_csv('active_type_ids.csv').type_id.values
 INV_TYPES = pd.read_csv('invTypes.csv')
-ENGINE = sqlalchemy.create_engine('sqlite:////home/ec2-user/' + SQLITE_DB)
 
-def estimate_highlow_volumes(row):
-    """Estimate buy and sell volumes by assuming all items were sold at
-    either the max or min price"""
+HISTORY_JSON_DIR = './market_history/'
+DONEFILES_DIR = './donefiles/'
 
-    # | lowPrice , highPrice  |   | lowVol  |   | avgPrice * volume |
-    #                           x             =
-    # | 1        , 1          |   | highVol |   | volume |
+HISTORY_TABLE = 'history'
+FEATURES_TABLE = 'features'
+ORDERS_TABLE = 'orders'
 
-    a_matrix = [[row.lowPrice, row.highPrice], [1, 1]]
-    b_matrix = [row.avgPrice * row.volume, row.volume]
+MARKET_REGION = '10000030'
 
-    try:
-        lowVol, highVol = np.linalg.solve(a_matrix, b_matrix)
-    except np.linalg.LinAlgError:
-        return (np.nan, np.nan)
+def get_item_history(type_ids, region_id=MARKET_REGION):
+    """Get the market history for all items in 'type_ids' """
 
-    return (highVol, lowVol)
+    crest_history_url = 'https://crest-tq.eveonline.com/market/{region_id}/history/?type=https://public-crest.eveonline.com/inventory/types/{type_id}/'
+
+    for i, type_id in enumerate(type_ids):
+
+        try:
+            assert type(int(type_id)) == int, 'could not cast type_id to int'
+            req = rq.get(crest_history_url.format(region_id=region_id, type_id=type_id))
+
+        except Exception as e:
+            logger.error('Failed to get info for typeID - {} - with error {}'.format(type_id, e))
+            return None
+
+        save_path = HISTORY_JSON_DIR +'{region_id}/{type_id}.json'
+        with open(save_path.format(region_id=region_id, type_id=type_id), 'w') as outfile:
+            json.dump(req.json(), outfile)
 
 
-def process_scraped_json(filename, data_dir='/home/ec2-user/scraped/'):
-    with open(os.path.join(data_dir, filename)) as data_file:
+def process_scraped_json(filename):
+    """Read a scraped market history json file and return a Dataframe
+    indexed by date with the raw market data as well as some derived statistics."""
+
+    with open(os.path.join(HISTORY_JSON_DIR + MARKET_REGION, filename)) as data_file:
         data = json.load(data_file)
 
     raw_df = pd.DataFrame.from_dict(data['items'], orient='columns')
@@ -63,118 +76,33 @@ def process_scraped_json(filename, data_dir='/home/ec2-user/scraped/'):
     return raw_df
 
 
-ACTIVE_TYPE_IDS = pd.read_csv('active_type_ids.csv').type_id.values
-HISTORY_JSON_DIR = '/home/ec2-user/scraped/'
+def estimate_highlow_volumes(row):
+    """Estimate buy and sell volumes by assuming all items were sold at
+    either the max or min price"""
 
-class ProcessHistoryJSONFiles(luigi.Task):
+    # | lowPrice , highPrice  |   | lowVol  |   | avgPrice * volume |
+    #                           x             =
+    # | 1        , 1          |   | highVol |   | volume |
 
-    def output(self):
-        return luigi.LocalTarget('processed_history_data.csv')
+    a_matrix = [[row.lowPrice, row.highPrice], [1, 1]]
+    b_matrix = [row.avgPrice * row.volume, row.volume]
 
-    def requires(self):
-        return []
+    try:
+        lowVol, highVol = np.linalg.solve(a_matrix, b_matrix)
+    except np.linalg.LinAlgError:
+        return (np.nan, np.nan)
 
-        #return [the download and filter json files task]
-
-    def run(self):
-
-        df_list = []
-        for i, json_file in enumerate(os.listdir(HISTORY_JSON_DIR)):
-            df = process_scraped_json(json_file)
-
-            if i % 100 == 0:
-                logger.info('Done with {}/{}'.format(i, len(os.listdir(HISTORY_JSON_DIR))))
-
-            df_list.append(df)
-
-        df_final = pd.concat(df_list)
-
-        with self.output().open('w') as out_file:
-            df_final.to_csv(out_file)
-
-
-class PushProcessedHistoryToDB(luigi.Task):
-
-    def output(self):
-        # TODO: fix / find a better way for this
-        return luigi.LocalTarget('PushProcessedHistoryToDB-Done.luigi')
-
-    def requires(self):
-        return ProcessHistoryJSONFiles()
-
-    def run(self):
-
-        con = sqlite3.connect(SQLITE_DB)
-
-        with self.input().open('r') as input_file:
-            df = pd.read_csv(input_file)
-            df.to_sql('history', con, if_exists='replace', index=True)
-
-        # touch the output file to track that the task is done
-        # TODO: figure out SQL DB outputs in luigi
-        with self.output().open('w') as output_file:
-            pass
-
-
-HISTORY_TABLE = 'history'
-
-class DownloadOrdersForTopNTypeIDs(luigi.Task):
-
-    n = luigi.IntParameter()
-
-    def output(self):
-        #return luigi.LocalTarget(self.__name__ + '-Done.luigi')
-        return luigi.LocalTarget('TopNMarketOrders.csv')
-
-    def requires(self):
-        return PushProcessedHistoryToDB()
-
-    def run(self):
-
-        SQLITE_DATE_FMT = '%Y-%m-%d'
-        type_names = INV_TYPES[['typeID', 'typeName']].set_index('typeID')
-
-        # only pull history from the past two weeks
-        # TODO: make this variable
-        today = dt.date.today()
-        two_wks_ago = today - dt.timedelta(days=14)
-        sql_query = 'SELECT * FROM history WHERE date BETWEEN "{}" AND "{}"'.format(
-            two_wks_ago.strftime(SQLITE_DATE_FMT),
-            today.strftime(SQLITE_DATE_FMT))
-
-        # connect to sqlite, pull in the history data
-        engine = sqlalchemy.create_engine('sqlite:////home/ec2-user/' + SQLITE_DB)
-        connection = engine.connect()
-        df = pd.read_sql_query(sql_query, connection, parse_dates=['date'])
-
-        volume_avgs = (df[['type_id', 'volume_isk', 'volume', 'lowVol', 'highVol']]
-                       .groupby('type_id')
-                       .mean()
-                       .sort_values('volume_isk', ascending=False)
-                       .join(type_names))
-
-        type_ids = volume_avgs.head(self.n).index.values
-
-        df_list = []
-        for type_id in type_ids:
-            df_list.append(get_market_orders(type_id=type_id))
-
-        df = pd.concat(df_list)
-
-        with self.output().open('w') as out_file:
-            df.to_csv(out_file, index=False)
+    return (highVol, lowVol)
 
 
 def get_market_orders(region_id='10000030', type_id='34'):
     """Get the current market orders for an item in a region.
-
     API has 6 min cache time."""
 
-    crest_order_url = 'https://crest-tq.eveonline.com/market/{}/orders/{}/?type=https://public-crest.eveonline.com/types/{}/'
+    crest_order_url = 'https://crest-tq.eveonline.com/market/{}/orders/{}/?type=https://public-crest.eveonline.com/inventory/types/{}/'
 
     dfs = []
     for order_type in ['buy', 'sell']:
-
         resp = rq.get(crest_order_url.format(region_id, order_type, type_id))
         resp_json = resp.json()
         dfs.append(pd.DataFrame(resp_json['items']))
@@ -182,12 +110,12 @@ def get_market_orders(region_id='10000030', type_id='34'):
     orders = pd.concat(dfs)
 
     def extract_station_id(loc_dict):
-        """Pull the station ID out of the CREST callback url, add as a column"""
+        """Pull the station ID out of the CREST callback url"""
         return int(loc_dict['id'])
     orders['station_id'] = orders.location.apply(extract_station_id)
 
     def extract_type_id(type_dict):
-        """Pull the type ID out of the CREST callback url, add as a column"""
+        """Pull the type ID out of the CREST callback url"""
         return int(type_dict['id'])
     orders['type_id'] = orders.type.apply(extract_type_id)
 
@@ -206,31 +134,8 @@ def get_market_orders(region_id='10000030', type_id='34'):
     return orders.sort_values('price')
 
 
-class PushMarketOrdersToDB(luigi.Task):
-
-    def output(self):
-        # TODO: fix / find a better way for this
-        return luigi.LocalTarget('PushMarketOrdersToDB-Done.luigi')
-
-    def requires(self):
-        return DownloadOrdersForTopNTypeIDs()
-
-    def run(self):
-
-        # TODO: standardize to use sqlalchemy everywhere
-        # use one engine for whole pipeline
-        con = sqlite3.connect(SQLITE_DB)
-
-        with self.input().open('r') as input_file:
-            df = pd.read_csv(input_file)
-            df.to_sql('orders', con, if_exists='replace', index=False)
-
-        # touch the output file to track that the task is done
-        # TODO: figure out SQL DB outputs in luigi
-        with self.output().open('w') as output_file:
-            pass
-
 def calculate_margin(type_id, db_conn):
+    """Calculate the margin for an given item using orders stored in the database"""
 
     sql_query = 'SELECT * FROM orders WHERE type_id == {}'.format(type_id)
     df = pd.read_sql_query(sql_query, db_conn)
@@ -252,15 +157,173 @@ def calculate_margin(type_id, db_conn):
 
     return (max_buy, min_sell, margin, margin_actual)
 
-class CreateFeaturesTable(luigi.Task):
 
-    n = luigi.IntParameter()
+class DownloadHistoryJSONFiles(luigi.Task):
+    """Download the market history for all actively traded items"""
 
     def output(self):
-        return luigi.LocalTarget('CreateFeaturesTable-Done.luigi')
+        return luigi.LocalTarget(os.path.join(DONEFILES_DIR, 'DownloadHistoryJSONFiles-Done.luigi'))
 
     def requires(self):
-        return PushMarketOrdersToDB()
+        return []
+
+    def run(self):
+
+        n_threads = 150
+    
+        type_ids = pd.read_csv('active_type_ids.csv').type_id.values
+
+        threads = [threading.Thread(name = 'thread_{}'.format(i), 
+                                    target = get_item_history, 
+                                    args = [type_ids[i::n_threads]])
+                   for i in range(n_threads)]
+    
+        # start all the threads
+        for t in threads:
+            t.start()
+
+        # wait for all threads to complete
+        for t in threads:
+            t.join()
+
+        # touch the donefile to let luigi know this task is done
+        with self.output().open('w') as output_file:
+            pass
+
+class ProcessHistoryJSONFiles(luigi.Task):
+
+    def output(self):
+        return luigi.LocalTarget('processed_history_data.csv')
+
+    def requires(self):
+        return DownloadHistoryJSONFiles()
+
+        #return [the download and filter json files task]
+
+    def run(self):
+        """Read all the scraped JSON files and put them into a single csv file"""
+
+        df_list = []
+        for i, json_file in enumerate(os.listdir(HISTORY_JSON_DIR + MARKET_REGION)):
+            df = process_scraped_json(json_file)
+
+            if i % 100 == 0:
+                logger.info('Done with {}/{}'.format(i, len(os.listdir(HISTORY_JSON_DIR + MARKET_REGION))))
+
+            df_list.append(df)
+
+        df_final = pd.concat(df_list)
+
+        with self.output().open('w') as out_file:
+            df_final.to_csv(out_file)
+
+
+class PushProcessedHistoryToDB(luigi.Task):
+
+    def output(self):
+        # TODO: fix / find a better way for this
+        return luigi.LocalTarget(os.path.join(DONEFILES_DIR, 'PushProcessedHistoryToDB-Done.luigi'))
+
+    def requires(self):
+        return ProcessHistoryJSONFiles()
+
+    def run(self):
+
+        db_conn = ENGINE.connect()
+
+        with self.input().open('r') as input_file:
+            df = pd.read_csv(input_file)
+            df.to_sql('history', db_conn, if_exists='replace', index=True, chunksize=1000)
+
+        # touch the output file to track that the task is done
+        # TODO: figure out SQL DB outputs in luigi
+        with self.output().open('w') as output_file:
+            pass
+
+
+class DownloadOrdersForTopNTypeIDs(luigi.Task):
+
+    #n = luigi.IntParameter()
+    n = 100
+
+    def output(self):
+        #return luigi.LocalTarget(self.__name__ + '-Done.luigi')
+        return luigi.LocalTarget('TopNMarketOrders.csv')
+
+    def requires(self):
+        return PushProcessedHistoryToDB()
+
+    def run(self):
+
+        SQLITE_DATE_FMT = '%Y-%m-%d'
+        type_names = INV_TYPES[['typeID', 'typeName']].set_index('typeID')
+
+        # only pull history from the past two weeks
+        # TODO: make this variable
+        today = dt.date.today()
+        # TODO: change this back to 14 days
+        two_wks_ago = today - dt.timedelta(days=30)
+        sql_query = 'SELECT * FROM history WHERE date BETWEEN "{}" AND "{}"'.format(
+            two_wks_ago.strftime(SQLITE_DATE_FMT),
+            today.strftime(SQLITE_DATE_FMT))
+
+        # connect to sqlite, pull in the history data
+        db_conn = ENGINE.connect()
+        df = pd.read_sql_query(sql_query, db_conn, parse_dates=['date'])
+
+        volume_avgs = (df[['type_id', 'volume_isk', 'volume', 'lowVol', 'highVol']]
+                       .groupby('type_id')
+                       .mean()
+                       .sort_values('volume_isk', ascending=False)
+                       .join(type_names))
+
+        type_ids = volume_avgs.head(self.n).index.values
+
+        df_list = []
+        for type_id in type_ids:
+            df_list.append(get_market_orders(type_id=type_id))
+
+        df = pd.concat(df_list)
+
+        with self.output().open('w') as out_file:
+            df.to_csv(out_file, index=False)
+
+
+class PushMarketOrdersToDB(luigi.Task):
+
+    def output(self):
+        # TODO: fix / find a better way for this
+        return luigi.LocalTarget(os.path.join(DONEFILES_DIR, 'PushMarketOrdersToDB-Done.luigi'))
+
+    def requires(self):
+        return DownloadOrdersForTopNTypeIDs()
+
+    def run(self):
+
+        # TODO: standardize to use sqlalchemy everywhere
+        # use one engine for whole pipeline
+        db_conn = ENGINE.connect()
+
+        with self.input().open('r') as input_file:
+            df = pd.read_csv(input_file)
+            df.to_sql('orders', db_conn, if_exists='replace', index=False)
+
+        # touch the output file to track that the task is done
+        # TODO: figure out SQL DB outputs in luigi
+        with self.output().open('w') as output_file:
+            pass
+
+
+class CreateFeaturesTable(luigi.Task):
+
+    #n = luigi.IntParameter()
+    n = 100
+
+    def output(self):
+        return luigi.LocalTarget(os.path.join(DONEFILES_DIR,'CreateFeaturesTable-Done.luigi'))
+
+    def requires(self):
+        return [PushProcessedHistoryToDB(), PushMarketOrdersToDB()]
 
     def run(self):
 
@@ -270,46 +333,107 @@ class CreateFeaturesTable(luigi.Task):
         today = dt.date.today()
         two_wks_ago = today - dt.timedelta(days=14)
 
+        # get the type_ids of the the top n items by 2-week average isk volume
         sql_query = 'SELECT * FROM history WHERE date BETWEEN "{}" AND "{}"'.format(
             two_wks_ago.strftime(SQLITE_DATE_FMT),
             today.strftime(SQLITE_DATE_FMT))
 
         df = pd.read_sql_query(sql_query, db_conn, parse_dates=['date'])
 
-        type_name_df = INV_TYPES[['typeID', 'typeName']].set_index('typeID')
+        top_n_type_ids = (df[['type_id', 'volume_isk']]
+                            .groupby('type_id')
+                            .mean()
+                            .sort_values('volume_isk', ascending=False)
+                            .head(self.n)
+                            .index.values)
+        print(top_n_type_ids)
 
-       # get daily average of features from the past two weeks for top n type_ids (by ISK volume)
-        volume_avgs = (df[['type_id', 'volume_isk', 'volume', 'lowVol', 'highVol']]
-                       .groupby('type_id')
-                       .mean()
-                       .sort_values('volume_isk', ascending=False)
-                       .join(type_name_df)
-                       .dropna()
-                       .head(self.n))
+        # generate each feature as a pd.Series or pd.DataFrame, indexed by type_id
+        features_list = []
 
+        #############################
+        # FEATURES: n-day average of history statistics (prices, volumes)
+        #############################
+
+        type_name_df = INV_TYPES[['typeID', 'typeName']].set_index('typeID').ix[top_n_type_ids]
+
+        def get_n_day_avgs(n_days):
+            """Get averages of volume, volume_isk, lowVol, highVol, limitVol over past n days"""
+            
+            period_end = dt.date.today()
+            period_start = today - dt.timedelta(days=n_days)
+    
+            sql_query = 'SELECT * FROM history WHERE date BETWEEN "{}" AND "{}"'.format(
+                period_start.strftime(SQLITE_DATE_FMT),
+                period_end.strftime(SQLITE_DATE_FMT))
+    
+            df = pd.read_sql_query(sql_query, db_conn, parse_dates=['date'])
+
+            volume_avgs = (df[['type_id', 'volume_isk', 'volume', 'lowVol', 'highVol', 'avgPrice']]
+                           .groupby('type_id')
+                           .mean()
+                           .sort_values('volume_isk', ascending=False))
+
+            volume_avgs['limitVol'] = volume_avgs.loc[:, ['lowVol', 'highVol']].min(axis=1)
+
+            volume_avgs.columns = ['{}_{}day'.format(column_name, n_days) for column_name in volume_avgs.columns]
+
+            return volume_avgs
+
+        volumes_1day = get_n_day_avgs(1)
+        volumes_7day = get_n_day_avgs(7)
+        volumes_14day = get_n_day_avgs(14)
+        volumes_30day = get_n_day_avgs(30)
+
+        features_list.extend([volumes_1day, volumes_7day, volumes_14day, volumes_30day])
+
+        #############################
+        # FEATURES: current margins on orders
+        #############################
+
+        # calculate the various margins for each type_id, store in dict: {type_id: (max_buy, min_sell ...)}
         margins = {}
-
-        # make a dict of the features for each type_id: {type_id: {max_buy, min_sell ...}}
-        for type_id in volume_avgs.index.values:
+        for type_id in top_n_type_ids:
             cols = ['max_buy', 'min_sell', 'margin', 'margin_actual']
             margins[type_id] = dict(zip(cols, calculate_margin(type_id, db_conn)))
 
         # convert the dict of dicts to a df
-        margin_df = pd.DataFrame(margins).transpose()
+        margins_df = pd.DataFrame(margins).transpose()
 
-        # join the margin info with the volume info
-        feature_df = margin_df.join(volume_avgs).dropna()
+        features_list.append(margins_df)
 
-        # add some more feature columns
-        feature_df['margin_isk'] = feature_df.margin_actual * feature_df.volume_isk
-        feature_df['limitVol'] = feature_df.loc[:, ['lowVol', 'highVol']].min(axis=1)
+        #############################
+        # FEATURES: statistics about orders
+        #############################
 
-        feature_df = feature_df.sort_values('margin_isk', ascending=False)
+        sql_query = 'SELECT type_id, issued  FROM orders'.format(type_id)
+        orders_df = pd.read_sql_query(sql_query, db_conn)
+
+        # number of active orders
+        n_active_orders = orders_df.groupby('type_id').count()
+        n_active_orders.columns = ['n_active_orders']
+
+        # TODO implement this
+        # time since last order update
+        #t_since_last_order = 
+
+        features_list.append(n_active_orders)
+        
+        #############################
+        # join all features
+        #############################
+
+        # join all the feature sub-dataframes
+        feature_df = type_name_df.join(features_list)
+
+        # add some derived feature columns
+        feature_df['margin_isk_7day'] = feature_df.margin_actual * feature_df.limitVol_7day * feature_df.avgPrice_7day
 
         feature_df.to_sql('features', db_conn, if_exists='replace', index=False)
 
         with self.output().open('w') as out_file:
             pass
+
 
 if __name__ == '__main__':
     luigi.run()
