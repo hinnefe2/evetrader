@@ -5,6 +5,7 @@ import sys
 import threading
 import datetime as dt
 import requests as rq
+import bs4
 import numpy as np
 import sqlalchemy
 import pandas as pd
@@ -313,7 +314,49 @@ class PushMarketOrdersToDB(luigi.Task):
         with self.output().open('w') as output_file:
             pass
 
+class AddRecentTransactionsToDB(luigi.Task):
+    """Download the character's transactions from the XML API"""
 
+    def output(self):
+        return luigi.LocalTarget(os.path.join(DONEFILES_DIR,'AddRecentTransactionsToDB-Done.luigi'))
+
+    def requires(self):
+        return []
+
+    def run(self):
+
+        db_conn = ENGINE.connect()
+
+        api_url = 'https://api.eveonline.com/char/WalletTransactions.xml.aspx?keyID={}&vCode={}&rowCount={}'
+        key_id = '442571'
+        access_code = '7qdTnpfrBfL3Gw2elwKaT9SsGkn6O5gwV3QUM77S3pHPanRBzzDyql5pCUU7V0bS'
+
+        # query the API and parse the returned xml with beautifulsoup
+        req = rq.get(api_url.format(key_id, access_code, 2560))
+        soup = bs4.BeautifulSoup(req.text, 'lxml')
+
+        # put the transactions in a dataframe
+        rows = soup.findAll('row')
+        row_dicts = [row.attrs for row in soup.findAll('row')]
+        df = pd.DataFrame(row_dicts)
+
+        # convert columns to the appropriate datatypes
+        numeric_cols = ['clientid', 'clienttypeid', 'journaltransactionid',
+            'price', 'quantity', 'stationid', 'transactionid','typeid']
+
+        datetime_cols = ['transactiondatetime']
+
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+        df[datetime_cols] = df[datetime_cols].apply(pd.to_datetime)
+
+        # get the existing transactions ids
+        existing_ids = pd.read_sql_table('transactions', db_conn).transactionid.values
+
+        # pull out the new transactions and put them in the database
+        new_transactions = df.loc[~df.transactionid.isin(existing_ids)]
+        new_transactions.to_sql('transactions', db_conn, if_exists='append', index=False)
+
+    
 class CreateFeaturesTable(luigi.Task):
 
     #n = luigi.IntParameter()
