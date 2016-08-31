@@ -90,3 +90,9 @@ ENV/
 
 # EVE API credentials
 credentials.yaml
+
+# vim undo files
+*.un~
+
+# jupyter notebooks
+*.ipynb

@@ -34,7 +34,8 @@ MARKET_REGION = '10000030'
 def get_item_history(type_ids, region_id=MARKET_REGION):
     """Get the market history for all items in 'type_ids' """
 
-    crest_history_url = 'https://crest-tq.eveonline.com/market/{region_id}/history/?type=https://public-crest.eveonline.com/inventory/types/{type_id}/'
+    crest_history_url = 'https://crest-tq.eveonline.com/market/{region_id}/history/?type=
+    https://public-crest.eveonline.com/inventory/types/{type_id}/'
 
     for i, type_id in enumerate(type_ids):
 
