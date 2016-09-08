@@ -19,8 +19,8 @@ logger.setLevel(logging.DEBUG)
 SQLITE_DB = 'evetrader.db'
 ENGINE = sqlalchemy.create_engine('sqlite:///' + os.path.join('.', SQLITE_DB))
 
-ACTIVE_TYPE_IDS = pd.read_csv('active_type_ids.csv').type_id.values
-INV_TYPES = pd.read_csv('invTypes.csv')
+ACTIVE_TYPE_IDS = pd.read_csv('profit.csv').type_id.values
+INV_TYPES = pd.read_csv('static/invTypes.csv')
 
 HISTORY_JSON_DIR = './market_history/'
 DONEFILES_DIR = './donefiles/'
@@ -34,8 +34,8 @@ MARKET_REGION = '10000030'
 def get_item_history(type_ids, region_id=MARKET_REGION):
     """Get the market history for all items in 'type_ids' """
 
-    crest_history_url = 'https://crest-tq.eveonline.com/market/{region_id}/history/?type=
-    https://public-crest.eveonline.com/inventory/types/{type_id}/'
+    crest_history_url = ('https://crest-tq.eveonline.com/market/{region_id}/history/?type='
+                         'https://public-crest.eveonline.com/inventory/types/{type_id}/')
 
     for i, type_id in enumerate(type_ids):
 
@@ -350,11 +350,16 @@ class AddRecentTransactionsToDB(luigi.Task):
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
         df[datetime_cols] = df[datetime_cols].apply(pd.to_datetime)
 
-        # get the existing transactions ids
-        existing_ids = pd.read_sql_table('transactions', db_conn).transactionid.values
+        try:
+            # get the existing transactions ids
+            existing_ids = pd.read_sql_table('transactions', db_conn).transactionid.values
 
-        # pull out the new transactions and put them in the database
-        new_transactions = df.loc[~df.transactionid.isin(existing_ids)]
+            # pull out the new transactions and put them in the database
+            new_transactions = df.loc[~df.transactionid.isin(existing_ids)]
+
+        except:
+            new_transactions = df
+
         new_transactions.to_sql('transactions', db_conn, if_exists='append', index=False)
 
     

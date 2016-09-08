@@ -17,7 +17,8 @@ static_dir = "static"
 
 # read in the list of item type_ids for items that
 # are actively traded
-active_type_ids = pd.read_csv(os.path.join(static_dir, 'active_type_ids.csv')).type_id.values[:10]
+#active_type_ids = pd.read_csv(os.path.join(static_dir, 'active_type_ids.csv')).type_id.values[:10]
+active_type_ids = pd.read_csv('profit.csv').typeid.values
 
 # location_id of station in which we're trading
 station_id = 60004588   # Rens
