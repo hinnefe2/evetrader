@@ -6,6 +6,7 @@ import re
 import requests as rq
 import json
 
+import bs4
 import pandas as pd
 
 import config
@@ -49,33 +50,67 @@ def get_orders(type_id, region_id=MARKET_REGION):
     return json.dumps(responses)
 
 
+def get_transactions(key_id, access_code):
+    """Get the transaction history for the character with the given API key"""
+
+    xml_url = 'https://api.eveonline.com/char/WalletTransactions.xml.aspx?keyID={}&vCode={}&rowCount={}'
+
+    key_id = '442571'
+    access_code = '7qdTnpfrBfL3Gw2elwKaT9SsGkn6O5gwV3QUM77S3pHPanRBzzDyql5pCUU7V0bS'
+
+    # query the API and parse the returned xml with beautifulsoup
+    response = rq.get(xml_url.format(key_id, access_code, 2560))
+    soup = bs4.BeautifulSoup(response.text, 'lxml')
+
+    # put the transactions in a dataframe
+    rows = soup.findAll('row')
+    row_dicts = [row.attrs for row in soup.findAll('row')]
+    df = pd.DataFrame(row_dicts)
+
+    # convert columns to the appropriate datatypes
+    numeric_cols = ['clientid', 'clienttypeid', 'journaltransactionid',
+        'price', 'quantity', 'stationid', 'transactionid','typeid']
+
+    datetime_cols = ['transactiondatetime']
+
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+    df[datetime_cols] = df[datetime_cols].apply(pd.to_datetime)
+
+    return df.to_csv(index=False)
+
+
 def process_orders_json(filename):
     """Read a scraped market order json file and return a Dataframe
     with the raw market data"""
 
     df = pd.read_json(os.path.join(config.orders_dir, filename))
     
-    # pull the type_id and name out of the 'type' dictionary
-    df['type_id'] = df.type.apply(lambda row: int(row['id']))
-    df['type_name'] = df.type.apply(lambda row: row['name'])
+    try:
+        # pull the type_id and name out of the 'type' dictionary
+        df['type_id'] = df.type.apply(lambda row: int(row['id']))
+        df['type_name'] = df.type.apply(lambda row: row['name'])
+        
+        # pull the location_id and name out of the 'location' dictionary
+        df['location_id'] = df.location.apply(lambda row: int(row['id']))
+        df['location_name'] = df.location.apply(lambda row: row['name'])
+        
+        # add information about when the file was created
+        modified = time.gmtime(os.path.getmtime(os.path.join(config.orders_dir, filename)))
+        df['recorded'] = pd.to_datetime(time.strftime('%Y-%m-%d %H:%M', modified))
+
+        # convert the 'issued' column to a datetime
+        df['issued'] = pd.to_datetime(df['issued'])
+
+        # drop unneccesary columns
+        str_cols = [col for col in df.columns if '_str' in col]
+        df = df.drop(str_cols, axis=1)
+        df = df.drop(['href', 'location', 'type'], axis=1)
     
-    # pull the location_id and name out of the 'location' dictionary
-    df['location_id'] = df.location.apply(lambda row: int(row['id']))
-    df['location_name'] = df.location.apply(lambda row: row['name'])
-    
-    # add information about when the file was created
-    modified = time.gmtime(os.path.getmtime(os.path.join(config.orders_dir, filename)))
-    df['last_modified'] = pd.to_datetime(time.strftime('%Y-%m-%d %H:%M', modified))
+        return df
 
-    # convert the 'issued' column to a datetime
-    df['issued'] = pd.to_datetime(df['issued'])
+    except:
 
-    # drop unneccesary columns
-    str_cols = [col for col in df.columns if '_str' in col]
-    df = df.drop(str_cols, axis=1)
-    df = df.drop(['href', 'location', 'type'], axis=1)
-
-    return df
+        return pd.DataFrame()
     
 
 def process_history_json(filename):
@@ -98,7 +133,7 @@ def process_history_json(filename):
 
     # add information about when the file was created
     modified = time.gmtime(os.path.getmtime(os.path.join(config.history_dir, filename)))
-    raw_df['last_modified'] = pd.to_datetime(time.strftime('%Y-%m-%d %H:%M', modified))
+    raw_df['recorded'] = pd.to_datetime(time.strftime('%Y-%m-%d %H:%M', modified))
 
     # add a column with the volume in ISK
     raw_df['volume_isk'] = raw_df.avgPrice * raw_df.volume

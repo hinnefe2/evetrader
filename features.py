@@ -77,6 +77,17 @@ class VolumeISKAvg1Week(FeatureBase):
         return result
     
 
+class VolumeUnitsAvg1Week(FeatureBase):
+    
+    def _build(self):
+        result = (self.history
+                      .loc[self.history.date >= dt.datetime.today() - dt.timedelta(days=7)]
+                      .groupby('type_id')
+                      .mean()
+                      .volume)
+        return result
+
+ 
 class NumCompetingSellOrders(FeatureBase):
     
     def _build(self):
